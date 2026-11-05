@@ -74,43 +74,85 @@ class RegimeState(str, Enum):
     CHAOTIC_TRANSITION = 'CHAOTIC_TRANSITION'
 
 # ---------------------------------------------------------------------------
-# Request Schemas (Preserved)
+# Request Schemas (Preserved & Extended for User-Supplied Signals)
 # ---------------------------------------------------------------------------
 class EntropyInput(BaseModel):
-    signal: str = Field(default='air_quality', description='Signal type')
+    signal: str = Field(default='air_quality', description='Signal type or domain name')
+    data: Optional[List[float]] = Field(default=None, description='Optional user-provided raw time series vector')
     window_days: int = Field(default=30, description='Analysis window in days')
     lat: float = Field(default=2.27, description='Latitude')
     lon: float = Field(default=102.55, description='Longitude')
 
 class PredictabilityInput(BaseModel):
-    signal: str = Field(default='solar_irradiance', description='Signal type')
+    signal: str = Field(default='solar_irradiance', description='Signal type or domain name')
+    data: Optional[List[float]] = Field(default=None, description='Optional user-provided raw time series vector')
     window_days: int = Field(default=90, description='Analysis window in days')
 
 class HarmonicsInput(BaseModel):
-    signal: str = Field(default='earthquakes', description='Signal type')
+    signal: str = Field(default='earthquakes', description='Signal type or domain name')
+    data: Optional[List[float]] = Field(default=None, description='Optional user-provided raw time series vector')
     window_days: int = Field(default=365, description='Analysis window in days')
 
 class SynchronyInput(BaseModel):
     signal_a: str = Field(default='solar_irradiance', description='First signal')
     signal_b: str = Field(default='human_activity', description='Second signal')
+    data_a: Optional[List[float]] = Field(default=None, description='Optional user-provided raw vector for signal A')
+    data_b: Optional[List[float]] = Field(default=None, description='Optional user-provided raw vector for signal B')
     window_days: int = Field(default=90, description='Analysis window in days')
 
 class TensorInput(BaseModel):
-    signal: str = Field(default='air_quality', description='Signal type')
+    signal: str = Field(default='air_quality', description='Signal type or domain name')
+    data: Optional[List[float]] = Field(default=None, description='Optional user-provided raw time series vector')
     window_days: int = Field(default=30, description='Analysis window in days')
 
 class UnifiedSignalInput(BaseModel):
-    signal: str = Field(default='earth_system', description='Signal type')
+    signal: str = Field(default='earth_system', description='Signal type or domain name')
+    data: Optional[List[float]] = Field(default=None, description='Optional user-provided raw time series vector')
     lat: float = Field(default=2.27, description='Latitude')
     lon: float = Field(default=102.55, description='Longitude')
 
 # ---------------------------------------------------------------------------
-# Coordinate Validation & Signal Generators
+# Coordinate Validation & Deterministic Scaling Utility (Fix 3)
 # ---------------------------------------------------------------------------
 def validate_coordinates(lat: float = 0.0, lon: float = 0.0, *_extra_args, **_extra_kwargs):
     if lat < -90 or lat > 90 or lon < -180 or lon > 180:
         raise HTTPException(status_code=400, detail='Invalid coordinates')
 
+def z_score_normalize(series: np.ndarray) -> np.ndarray:
+    """Deterministic standardization: (x - mean) / std."""
+    cleaned = series[~np.isnan(series)] if len(series) > 0 else np.array([], dtype=float)
+    if len(cleaned) < 2:
+        return series
+    std_val = float(np.std(cleaned))
+    if std_val <= 0:
+        return np.zeros_like(cleaned)
+    return (cleaned - float(np.mean(cleaned))) / std_val
+
+def min_max_scale(series: np.ndarray, feature_range: tuple = (0.0, 1.0)) -> np.ndarray:
+    """Deterministic min-max normalization scaling vector to bounded range."""
+    cleaned = series[~np.isnan(series)] if len(series) > 0 else np.array([], dtype=float)
+    if len(cleaned) < 2:
+        return series
+    min_val, max_val = float(np.min(cleaned)), float(np.max(cleaned))
+    if max_val <= min_val:
+        return np.full_like(cleaned, feature_range[0])
+    scaled = (cleaned - min_val) / (max_val - min_val)
+    return scaled * (feature_range[1] - feature_range[0]) + feature_range[0]
+
+def robust_scale(series: np.ndarray) -> np.ndarray:
+    """Deterministic median & Interquartile Range (IQR) scaling."""
+    cleaned = series[~np.isnan(series)] if len(series) > 0 else np.array([], dtype=float)
+    if len(cleaned) < 4:
+        return series
+    q25, q75 = np.percentile(cleaned, 25), np.percentile(cleaned, 75)
+    iqr = q75 - q25
+    if iqr <= 0:
+        return np.zeros_like(cleaned)
+    return (cleaned - float(np.median(cleaned))) / iqr
+
+# ---------------------------------------------------------------------------
+# Deterministic Signal Generator (Fix 1: Zero Random Seeds)
+# ---------------------------------------------------------------------------
 def generate_synthetic_signal(
     signal_type: str = 'air_quality',
     n: int = 500,
@@ -118,8 +160,8 @@ def generate_synthetic_signal(
     **_extra_kwargs,
 ) -> np.ndarray:
     """
-    Generates deterministic, mathematically rigorous time series based on signal type.
-    Zero random generators (no np.random.seed or np.random calls).
+    Generates deterministic waveforms based on physical signal attributes.
+    Uses purely analytical harmonics and trigonometric functions without np.random.seed or np.random calls.
     """
     sig = str(signal_type).lower() if signal_type is not None else 'default'
     t = np.linspace(0, 50, n)
@@ -139,17 +181,22 @@ def generate_synthetic_signal(
         base = np.sin(2.0 * np.pi * t / 24.0) + 0.4 * np.cos(2.0 * np.pi * t / 12.0)
         return base
     else:
-        # Deterministic harmonic modulation based on string character hash
         h = sum(ord(c) * (31 ** (i % 6)) for i, c in enumerate(sig))
         freq1 = 10.0 + (h % 15)
         freq2 = 3.0 + ((h >> 2) % 7)
         return np.sin(2.0 * np.pi * t / freq1) + 0.25 * np.cos(2.0 * np.pi * t / freq2)
 
+def _extract_or_generate_series(payload_data: Optional[List[float]], signal_name: str) -> np.ndarray:
+    """Extracts actual user-supplied signal data or falls back to the deterministic signal generator."""
+    if payload_data is not None and len(payload_data) > 0:
+        return np.array(payload_data, dtype=float)
+    return generate_synthetic_signal(signal_name)
+
 # ---------------------------------------------------------------------------
-# Foundational Mathematical Entropy & Information Engines
+# Foundational Entropy & Information Engines (Fix 2: Zero Random Normal Calls)
 # ---------------------------------------------------------------------------
 def compute_shannon_entropy(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> float:
-    """Computes normalized Shannon entropy [0.0, 1.0] using probability density estimation."""
+    """Computes normalized Shannon entropy in [0.0, 1.0] using histogram density estimation."""
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
     if len(series) == 0:
@@ -178,7 +225,7 @@ def compute_conditional_entropy(series: np.ndarray = 0.0, *_extra_args, **_extra
 def compute_kl_divergence(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> float:
     """
     Computes Kullback-Leibler divergence against an analytical normal distribution.
-    Replaces pseudo-random normal generation with analytical norm.cdf integration.
+    Replaces stochastic sampling (np.random.normal) with exact CDF integration (norm.cdf).
     """
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
@@ -196,7 +243,6 @@ def compute_kl_divergence(series: np.ndarray = 0.0, *_extra_args, **_extra_kwarg
     mu = float(np.mean(cleaned))
     sigma = float(np.std(cleaned)) if np.std(cleaned) > 0 else 1.0
 
-    # Analytical normal integration over bin boundaries (zero random calls)
     cdf_vals = norm.cdf(bin_edges, loc=mu, scale=sigma)
     q = np.diff(cdf_vals)
     q = np.clip(q, 1e-08, 1.0)
@@ -206,7 +252,7 @@ def compute_kl_divergence(series: np.ndarray = 0.0, *_extra_args, **_extra_kwarg
     return max(0.0, round(kl, 4))
 
 def compute_fourier_harmonics(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> Dict[str, float]:
-    """Performs FFT power spectrum analysis to detect dominant frequencies and cycles."""
+    """Performs FFT power spectrum analysis to detect dominant frequencies and cycle duration."""
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
     if len(series) < 10:
@@ -233,7 +279,7 @@ def compute_fourier_harmonics(series: np.ndarray = 0.0, *_extra_args, **_extra_k
     }
 
 def compute_autocorrelation_persistence(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> float:
-    """Computes persistence using autocorrelation at lag 1."""
+    """Computes memory persistence using autocorrelation at lag 1."""
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
     cleaned = series[~np.isnan(series)]
@@ -250,7 +296,7 @@ def compute_cross_correlation_synchrony(
     *_extra_args,
     **_extra_kwargs,
 ) -> Dict[str, Any]:
-    """Computes cross-correlation and mutual information synchrony metrics."""
+    """Computes cross-correlation alignment and mutual information synchrony."""
     if not isinstance(series_a, np.ndarray):
         series_a = np.array(series_a, dtype=float)
     if not isinstance(series_b, np.ndarray):
@@ -279,8 +325,8 @@ def compute_cross_correlation_synchrony(
 
 def compute_complexity_metrics(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> Dict[str, Any]:
     """
-    Calculates variance, sample entropy, and complexity index.
-    Eliminates hardcoded 50 fallback; calculates directly on available points.
+    Calculates variance and entropy to derive dynamic complexity index (0-100).
+    Fix 4: Computes calculated fallback metrics directly from signal points.
     """
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
@@ -323,11 +369,11 @@ def compute_information_flux(series: np.ndarray = 0.0, *_extra_args, **_extra_kw
     return int(np.clip(flux, 0, 100))
 
 # ---------------------------------------------------------------------------
-# Required Advanced Intelligence Engines
+# Required Mathematical State Intelligence Engines
 # ---------------------------------------------------------------------------
 def compute_spectral_entropy(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> float:
     """
-    Step 1: Spectral Entropy Engine.
+    Feature 1: Spectral Entropy Engine.
     Uses FFT power spectrum frequency distribution to compute normalized spectral entropy (0-100).
     """
     if not isinstance(series, np.ndarray):
@@ -358,8 +404,8 @@ def compute_sample_entropy(
     **_extra_kwargs,
 ) -> float:
     """
-    Step 2: Sample Entropy Engine (SampEn).
-    Measures physiological and physical time-series irregularity/complexity.
+    Feature 2: Sample Entropy Engine (SampEn).
+    Evaluates physiological and physical time-series irregularity and dynamical complexity.
     """
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
@@ -399,8 +445,8 @@ def compute_permutation_entropy(
     **_extra_kwargs,
 ) -> float:
     """
-    Step 3: Permutation Entropy Engine.
-    Quantifies complexity of non-linear dynamic patterns via ordinal distribution.
+    Feature 3: Permutation Entropy Engine.
+    Quantifies complexity of non-linear dynamic patterns via ordinal permutations.
     Output: normalized float [0.0, 1.0].
     """
     if not isinstance(series, np.ndarray):
@@ -426,8 +472,8 @@ def compute_permutation_entropy(
 
 def compute_harmonic_stability(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> float:
     """
-    Step 6: Harmonic Stability Engine.
-    Calculates spectral energy concentration in primary Fourier peaks (0-100).
+    Feature 5: Harmonic Stability Engine.
+    Measures energy concentration across primary Fourier peaks (0-100).
     """
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
@@ -450,16 +496,20 @@ def compute_harmonic_stability(series: np.ndarray = 0.0, *_extra_args, **_extra_
 
 def compute_predictability_horizon(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> Dict[str, Any]:
     """
-    Step 7: Predictability Horizon Engine.
+    Feature 6: Predictability Horizon Engine.
     Calculates autocorrelation decay time to drop below 1/e (~0.368).
-    Outputs: estimated_stable_steps and forecast_horizon.
+    Outputs: estimated_stable_steps, forecast_horizon, and predictability_horizon.
     """
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
     cleaned = series[~np.isnan(series)] if len(series) > 0 else np.array([], dtype=float)
     n = len(cleaned)
     if n < 10:
-        return {'estimated_stable_steps': 5, 'forecast_horizon': ForecastHorizon.SHORT_TERM.value}
+        return {
+            'estimated_stable_steps': 5,
+            'forecast_horizon': ForecastHorizon.SHORT_TERM.value,
+            'predictability_horizon': 5,
+        }
 
     max_lags = min(n // 2, 50)
     autocorr = acf(cleaned, nlags=max_lags, fft=True)
@@ -480,20 +530,25 @@ def compute_predictability_horizon(series: np.ndarray = 0.0, *_extra_args, **_ex
     return {
         'estimated_stable_steps': int(stable_steps),
         'forecast_horizon': horizon,
+        'predictability_horizon': int(stable_steps),
     }
 
 def detect_regime_shift(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs) -> Dict[str, Any]:
     """
-    Step 8: Signal Regime Shift Detection.
+    Feature 7: Signal Regime Shift Detection.
     Evaluates moment drift and spectral entropy divergence across temporal partitions.
-    Outputs: regime_change_probability (0.0 to 1.0) and state_transition.
+    Outputs: regime_change_probability (0.0 to 1.0) and regime_shift_probability.
     """
     if not isinstance(series, np.ndarray):
         series = np.array(series, dtype=float)
     cleaned = series[~np.isnan(series)] if len(series) > 0 else np.array([], dtype=float)
     n = len(cleaned)
     if n < 16:
-        return {'regime_change_probability': 0.0, 'state_transition': RegimeState.STABLE_REGIME.value}
+        return {
+            'regime_change_probability': 0.0,
+            'regime_shift_probability': 0.0,
+            'state_transition': RegimeState.STABLE_REGIME.value,
+        }
 
     half = n // 2
     part1, part2 = cleaned[:half], cleaned[half:]
@@ -520,6 +575,7 @@ def detect_regime_shift(series: np.ndarray = 0.0, *_extra_args, **_extra_kwargs)
 
     return {
         'regime_change_probability': round(prob, 3),
+        'regime_shift_probability': round(prob, 3),
         'state_transition': transition,
     }
 
@@ -532,8 +588,8 @@ def classify_entropy_state(
     **_extra_kwargs,
 ) -> str:
     """
-    Step 5: Chaos Classification Engine.
-    Returns: ORDERED, CYCLICAL, COMPLEX, CHAOTIC based on structural entropy metrics.
+    Feature 8: Chaos Classification Engine.
+    Categorizes signals into: ORDERED, CYCLICAL, COMPLEX, CHAOTIC based on structural entropy metrics.
     """
     s_norm = max(0.0, min(100.0, shannon_norm * 100.0))
     sp_norm = max(0.0, min(100.0, spectral_entropy))
@@ -560,8 +616,8 @@ def compute_entropy_state_index(
     **_extra_kwargs,
 ) -> float:
     """
-    Step 4: Multi-Entropy Composite.
-    Synthesizes Shannon, spectral, sample, and permutation entropies into a single index (0-100).
+    Feature 4: Multi-Entropy Composite (ESI).
+    Combines Shannon, spectral, sample, and permutation entropies into a single metric (0-100).
     """
     s_norm = max(0.0, min(100.0, shannon_norm * 100.0))
     sp_norm = max(0.0, min(100.0, spectral_entropy))
@@ -572,7 +628,7 @@ def compute_entropy_state_index(
     return round(float(np.clip(raw, 0.0, 100.0)), 2)
 
 # ---------------------------------------------------------------------------
-# API Endpoints & MCP Tool Interfaces
+# API Endpoints & MCP Interfaces (Preserved)
 # ---------------------------------------------------------------------------
 @app.get('/')
 def root() -> Dict[str, Any]:
@@ -605,7 +661,7 @@ def tool_get_entropy(payload: Optional[EntropyInput] = None) -> Dict[str, Any]:
     if payload is None:
         payload = EntropyInput()
     validate_coordinates(payload.lat, payload.lon)
-    series = generate_synthetic_signal(payload.signal)
+    series = _extract_or_generate_series(payload.data, payload.signal)
 
     ent = compute_shannon_entropy(series)
     sp_ent = compute_spectral_entropy(series)
@@ -614,7 +670,6 @@ def tool_get_entropy(payload: Optional[EntropyInput] = None) -> Dict[str, Any]:
     esi = compute_entropy_state_index(ent, sp_ent, samp_ent, perm_ent)
     cls_state = classify_entropy_state(ent, sp_ent, samp_ent, perm_ent)
 
-    # Preserve legacy classification key
     if ent > 0.65:
         legacy_classification = 'HIGH_VARIABILITY'
     elif ent > 0.35:
@@ -636,7 +691,7 @@ def tool_get_entropy(payload: Optional[EntropyInput] = None) -> Dict[str, Any]:
 def tool_get_predictability(payload: Optional[PredictabilityInput] = None) -> Dict[str, Any]:
     if payload is None:
         payload = PredictabilityInput()
-    series = generate_synthetic_signal(payload.signal)
+    series = _extract_or_generate_series(payload.data, payload.signal)
     metrics = compute_predictability_stability(series)
     horizon = compute_predictability_horizon(series)
     regime = detect_regime_shift(series)
@@ -646,7 +701,9 @@ def tool_get_predictability(payload: Optional[PredictabilityInput] = None) -> Di
         'stability': metrics.get('stability', 0.0),
         'estimated_stable_steps': horizon.get('estimated_stable_steps', 5),
         'forecast_horizon': horizon.get('forecast_horizon', ForecastHorizon.SHORT_TERM.value),
+        'predictability_horizon': horizon.get('predictability_horizon', 5),
         'regime_change_probability': regime.get('regime_change_probability', 0.0),
+        'regime_shift_probability': regime.get('regime_shift_probability', 0.0),
         'state_transition': regime.get('state_transition', RegimeState.STABLE_REGIME.value),
     }
 
@@ -654,7 +711,7 @@ def tool_get_predictability(payload: Optional[PredictabilityInput] = None) -> Di
 def tool_get_harmonics(payload: Optional[HarmonicsInput] = None) -> Dict[str, Any]:
     if payload is None:
         payload = HarmonicsInput()
-    series = generate_synthetic_signal(payload.signal)
+    series = _extract_or_generate_series(payload.data, payload.signal)
     harmonics = compute_fourier_harmonics(series)
     harm_stab = compute_harmonic_stability(series)
     sp_ent = compute_spectral_entropy(series)
@@ -670,8 +727,8 @@ def tool_get_harmonics(payload: Optional[HarmonicsInput] = None) -> Dict[str, An
 def tool_get_synchrony(payload: Optional[SynchronyInput] = None) -> Dict[str, Any]:
     if payload is None:
         payload = SynchronyInput()
-    series_a = generate_synthetic_signal(payload.signal_a)
-    series_b = generate_synthetic_signal(payload.signal_b)
+    series_a = _extract_or_generate_series(payload.data_a, payload.signal_a)
+    series_b = _extract_or_generate_series(payload.data_b, payload.signal_b)
     sync = compute_cross_correlation_synchrony(series_a, series_b)
     return sync
 
@@ -679,7 +736,7 @@ def tool_get_synchrony(payload: Optional[SynchronyInput] = None) -> Dict[str, An
 def tool_get_tensor(payload: Optional[TensorInput] = None) -> Dict[str, Any]:
     if payload is None:
         payload = TensorInput()
-    series = generate_synthetic_signal(payload.signal)
+    series = _extract_or_generate_series(payload.data, payload.signal)
     ent = compute_shannon_entropy(series)
     pred_stab = compute_predictability_stability(series)
     harmonics = compute_fourier_harmonics(series)
@@ -710,15 +767,15 @@ def tool_get_tensor(payload: Optional[TensorInput] = None) -> Dict[str, Any]:
 @app.post('/tools/get_entropyos_signal')
 def tool_get_entropyos_signal(payload: Optional[UnifiedSignalInput] = None) -> Dict[str, Any]:
     """
-    Step 9: Unified EntropyOS Machine Signal.
+    Feature 9: Unified Mathematical Signal.
     Primary machine-consumable mathematical intelligence signal for autonomous agents.
-    Preserves all 6 legacy response keys while extending multi-entropy metrics.
+    Preserves all 6 legacy response keys while attaching advanced multi-entropy metrics.
     """
     if payload is None:
         payload = UnifiedSignalInput()
     validate_coordinates(payload.lat, payload.lon)
 
-    series = generate_synthetic_signal(payload.signal)
+    series = _extract_or_generate_series(payload.data, payload.signal)
     ent = compute_shannon_entropy(series)
     pred_stab = compute_predictability_stability(series)
     complexity_res = compute_complexity_metrics(series)
@@ -726,7 +783,7 @@ def tool_get_entropyos_signal(payload: Optional[UnifiedSignalInput] = None) -> D
     series_ref = generate_synthetic_signal('solar_irradiance')
     sync_res = compute_cross_correlation_synchrony(series, series_ref)
 
-    # Advanced mathematical intelligence
+    # Advanced mathematical intelligence features
     sp_ent = compute_spectral_entropy(series)
     samp_ent = compute_sample_entropy(series)
     perm_ent = compute_permutation_entropy(series)
@@ -750,7 +807,8 @@ def tool_get_entropyos_signal(payload: Optional[UnifiedSignalInput] = None) -> D
         'harmonic_stability': harm_stab,
         'predictability_horizon': horizon.get('estimated_stable_steps', 5),
         'forecast_horizon': horizon.get('forecast_horizon', ForecastHorizon.SHORT_TERM.value),
-        'regime_shift_probability': regime.get('regime_change_probability', 0.0),
+        'regime_shift_probability': regime.get('regime_shift_probability', 0.0),
+        'regime_change_probability': regime.get('regime_change_probability', 0.0),
         'state_transition': regime.get('state_transition', RegimeState.STABLE_REGIME.value),
         'spectral_entropy': sp_ent,
         'sample_entropy': samp_ent,
@@ -772,7 +830,7 @@ async def hourly_pipeline_worker():
         logger.info('processed_signal_pipeline', signal=sig)
 
 # ---------------------------------------------------------------------------
-# Standalone Runner
+# Standalone Server Execution
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
     import uvicorn
